@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"strconv"
 )
@@ -147,4 +148,15 @@ func (w *Writer) writeArray(vals []Value) error {
 func (w *Writer) writeNullArray() error {
 	_, err := w.wr.WriteString("*-1\r\n")
 	return err
+}
+
+// MarshalValue serialises a Value to its RESP wire format as a byte slice.
+// I use this for AOF logging — it avoids coupling the persistence layer
+// to the Writer's buffered I/O model.
+func MarshalValue(v Value) []byte {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.WriteValue(v)
+	w.Flush()
+	return buf.Bytes()
 }

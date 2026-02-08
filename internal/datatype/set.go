@@ -28,6 +28,18 @@ func (s *SetValue) Len() int {
 	return len(s.data)
 }
 
+// MembersSnapshot returns a copy of the set members under RLock.
+// I use this for persistence — copying under lock then encoding outside.
+func (s *SetValue) MembersSnapshot() map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string]struct{}, len(s.data))
+	for k := range s.data {
+		result[k] = struct{}{}
+	}
+	return result
+}
+
 // SetOps provides set operations on the store
 type SetOps struct {
 	store *store.ShardedMap

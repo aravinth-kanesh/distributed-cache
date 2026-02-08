@@ -28,6 +28,18 @@ func (h *HashValue) Len() int {
 	return len(h.data)
 }
 
+// DataSnapshot returns a copy of the hash data under RLock.
+// I use this for persistence — copying under lock then encoding outside.
+func (h *HashValue) DataSnapshot() map[string][]byte {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	result := make(map[string][]byte, len(h.data))
+	for k, v := range h.data {
+		result[k] = v
+	}
+	return result
+}
+
 // HashOps provides hash operations on the store
 type HashOps struct {
 	store *store.ShardedMap

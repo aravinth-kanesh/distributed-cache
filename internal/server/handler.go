@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aravinth/distributed-cache/internal/datatype"
+	"github.com/aravinth/distributed-cache/internal/persistence"
 	"github.com/aravinth/distributed-cache/internal/protocol"
 	"github.com/aravinth/distributed-cache/internal/store"
 )
@@ -23,17 +24,26 @@ type Handler struct {
 	setOps    *datatype.SetOps
 	commands  map[string]CommandFunc
 	startTime time.Time
+
+	// Persistence — nil when persistence is disabled
+	aofWriter      *persistence.AOFWriter
+	snapshotEngine *persistence.SnapshotEngine
+	aofRewriter    *persistence.AOFRewriter
 }
 
-// NewHandler creates a new handler and registers all commands
-func NewHandler(sm *store.ShardedMap) *Handler {
+// NewHandler creates a new handler and registers all commands.
+// The persistence arguments are optional — pass nil to disable AOF/snapshots.
+func NewHandler(sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persistence.SnapshotEngine, rewriter *persistence.AOFRewriter) *Handler {
 	h := &Handler{
-		store:     sm,
-		strOps:    datatype.NewStringOps(sm),
-		listOps:   datatype.NewListOps(sm),
-		hashOps:   datatype.NewHashOps(sm),
-		setOps:    datatype.NewSetOps(sm),
-		startTime: time.Now(),
+		store:          sm,
+		strOps:         datatype.NewStringOps(sm),
+		listOps:        datatype.NewListOps(sm),
+		hashOps:        datatype.NewHashOps(sm),
+		setOps:         datatype.NewSetOps(sm),
+		startTime:      time.Now(),
+		aofWriter:      aof,
+		snapshotEngine: snap,
+		aofRewriter:    rewriter,
 	}
 	h.registerCommands()
 	return h
@@ -53,7 +63,17 @@ func (h *Handler) Execute(val protocol.Value, conn *Connection) protocol.Value {
 		return protocol.ErrUnknownCmd(cmdName)
 	}
 
-	return fn(args, conn)
+	result := fn(args, conn)
+
+	// AOF hook: log successful mutating commands for durability.
+	// I serialise the original RESP array (not the result) so the AOF
+	// is a faithful replay log. The non-blocking channel send in
+	// AOFWriter.Log ensures this never stalls the hot path.
+	if h.aofWriter != nil && persistence.IsMutating(cmdName) && result.Type != protocol.Error {
+		h.aofWriter.Log(protocol.MarshalValue(val))
+	}
+
+	return result
 }
 
 func (h *Handler) registerCommands() {
@@ -147,6 +167,12 @@ func (h *Handler) registerCommands() {
 		"SINTERCARD":  h.cmdSInterCard,
 		"SDIFF":       h.cmdSDiff,
 		"SDIFFSTORE":  h.cmdSDiffStore,
+
+		// Persistence commands
+		"BGSAVE":        h.cmdBGSave,
+		"BGREWRITEAOF":  h.cmdBGRewriteAOF,
+		"LASTSAVE":      h.cmdLastSave,
+		"PEXPIREAT":     h.cmdPExpireAt,
 	}
 }
 
@@ -1271,6 +1297,62 @@ func (h *Handler) cmdSDiffStore(args []protocol.Value, conn *Connection) protoco
 	}
 	count := h.setOps.SDiffStore(dst, keys...)
 	return protocol.IntegerVal(int64(count))
+}
+
+// ==================== Persistence commands ====================
+
+func (h *Handler) cmdBGSave(args []protocol.Value, conn *Connection) protocol.Value {
+	if h.snapshotEngine == nil {
+		return protocol.ErrorVal("ERR snapshots are disabled")
+	}
+	if h.snapshotEngine.IsSaving() {
+		return protocol.ErrorVal("ERR background save already in progress")
+	}
+	go func() {
+		if _, err := h.snapshotEngine.Save(); err != nil {
+			fmt.Printf("BGSAVE error: %v\n", err)
+		}
+	}()
+	return protocol.SimpleStringVal("Background saving started")
+}
+
+func (h *Handler) cmdBGRewriteAOF(args []protocol.Value, conn *Connection) protocol.Value {
+	if h.aofRewriter == nil {
+		return protocol.ErrorVal("ERR AOF is disabled")
+	}
+	if h.aofWriter != nil && h.aofWriter.IsRewriting() {
+		return protocol.ErrorVal("ERR AOF rewrite already in progress")
+	}
+	go func() {
+		if err := h.aofRewriter.Rewrite(); err != nil {
+			fmt.Printf("BGREWRITEAOF error: %v\n", err)
+		}
+	}()
+	return protocol.SimpleStringVal("Background AOF rewrite started")
+}
+
+func (h *Handler) cmdLastSave(args []protocol.Value, conn *Connection) protocol.Value {
+	if h.snapshotEngine == nil {
+		return protocol.IntegerVal(0)
+	}
+	return protocol.IntegerVal(h.snapshotEngine.LastSaveTime())
+}
+
+func (h *Handler) cmdPExpireAt(args []protocol.Value, conn *Connection) protocol.Value {
+	if len(args) != 2 {
+		return protocol.ErrWrongArgNum("PEXPIREAT")
+	}
+	key := string(args[0].Bulk)
+	ms, err := strconv.ParseInt(string(args[1].Bulk), 10, 64)
+	if err != nil {
+		return protocol.ErrNotInteger
+	}
+	entry, exists := h.store.GetEntry(key)
+	if !exists {
+		return protocol.ValZero
+	}
+	entry.ExpiresAt = ms * 1e6 // Milliseconds to nanoseconds
+	return protocol.ValOne
 }
 
 // ==================== Utility ====================

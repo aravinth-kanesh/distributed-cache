@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aravinth/distributed-cache/internal/persistence"
 	"github.com/aravinth/distributed-cache/internal/pool"
 	"github.com/aravinth/distributed-cache/internal/store"
 )
@@ -50,12 +51,13 @@ type Server struct {
 	totalConns atomic.Uint64
 }
 
-// New creates a new server with the given config and backing store
-func New(cfg Config, sm *store.ShardedMap) *Server {
+// New creates a new server with the given config and backing store.
+// The persistence arguments are optional — pass nil to disable.
+func New(cfg Config, sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persistence.SnapshotEngine, rewriter *persistence.AOFRewriter) *Server {
 	return &Server{
 		config:  cfg,
 		store:   sm,
-		handler: NewHandler(sm),
+		handler: NewHandler(sm, aof, snap, rewriter),
 		bufPool: pool.NewBufferPool(),
 		conns:   make(map[uint64]*Connection),
 	}

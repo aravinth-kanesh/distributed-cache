@@ -33,6 +33,20 @@ func (l *ListValue) Len() int64 {
 	return l.len.Load()
 }
 
+// Elements returns all list elements from head to tail.
+// I hold the RLock during traversal to ensure a consistent snapshot.
+func (l *ListValue) Elements() [][]byte {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	result := make([][]byte, 0, l.len.Load())
+	node := l.head
+	for node != nil {
+		result = append(result, node.data)
+		node = node.next
+	}
+	return result
+}
+
 // ListOps provides list operations on the store
 type ListOps struct {
 	store *store.ShardedMap

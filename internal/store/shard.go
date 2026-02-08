@@ -413,6 +413,25 @@ func (sm *ShardedMap) ForEach(fn func(key string, entry *Entry) bool) {
 	}
 }
 
+// ForEachShard iterates one shard at a time, copying map references under
+// RLock then processing outside the lock. This minimises lock hold time
+// compared to ForEach, which holds the RLock for the entire callback.
+// I use this for snapshots where encoding can be slow.
+func (sm *ShardedMap) ForEachShard(fn func(data map[string]*Entry)) {
+	for i := 0; i < DefaultShardCount; i++ {
+		shard := sm.shards[i]
+		shard.mu.RLock()
+		snapshot := make(map[string]*Entry, len(shard.data))
+		for k, v := range shard.data {
+			if !v.IsExpired() {
+				snapshot[k] = v
+			}
+		}
+		shard.mu.RUnlock()
+		fn(snapshot)
+	}
+}
+
 // ExpireScan scans for and removes expired keys
 // Returns the number of expired keys removed
 func (sm *ShardedMap) ExpireScan(maxKeys int) int64 {
