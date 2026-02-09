@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/aravinth/distributed-cache/internal/datatype"
 	"github.com/aravinth/distributed-cache/internal/persistence"
 	"github.com/aravinth/distributed-cache/internal/protocol"
@@ -35,6 +37,10 @@ type Handler struct {
 	replState   *replication.ReplState
 	masterState *replication.MasterState
 	slaveState  *replication.SlaveState
+
+	// Metrics — nil when metrics are disabled
+	cmdCount    *prometheus.CounterVec
+	cmdDuration *prometheus.HistogramVec
 }
 
 // NewHandler creates a new handler and registers all commands.
@@ -56,6 +62,20 @@ func NewHandler(sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persiste
 	}
 	h.registerCommands()
 	return h
+}
+
+// SetMetrics injects the Prometheus command counters into the handler.
+// This is called after server creation so we avoid a circular dependency
+// between the server and metrics packages.
+func (h *Handler) SetMetrics(cc *prometheus.CounterVec, cd *prometheus.HistogramVec) {
+	h.cmdCount = cc
+	h.cmdDuration = cd
+}
+
+// StartTime returns when this handler was created (used by the metrics
+// collector to compute uptime).
+func (h *Handler) StartTime() time.Time {
+	return h.startTime
 }
 
 // Execute parses the command from a RESP array and dispatches it
@@ -82,7 +102,22 @@ func (h *Handler) Execute(val protocol.Value, conn *Connection) protocol.Value {
 		return protocol.ErrUnknownCmd(cmdName)
 	}
 
+	// Track command latency when metrics are enabled
+	var start time.Time
+	if h.cmdDuration != nil {
+		start = time.Now()
+	}
+
 	result := fn(args, conn)
+
+	// Metrics hook: count commands and observe latency. The nil guard
+	// keeps the handler working without Prometheus.
+	if h.cmdCount != nil {
+		h.cmdCount.WithLabelValues(cmdName).Inc()
+	}
+	if h.cmdDuration != nil {
+		h.cmdDuration.WithLabelValues(cmdName).Observe(time.Since(start).Seconds())
+	}
 
 	// AOF hook: log successful mutating commands for durability.
 	// I serialise the original RESP array (not the result) so the AOF

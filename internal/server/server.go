@@ -278,3 +278,8 @@ func (s *Server) ActiveConnections() int {
 func (s *Server) TotalConnections() uint64 {
 	return s.totalConns.Load()
 }
+
+// Handler returns the command handler so callers can inject metrics.
+func (s *Server) Handler() *Handler {
+	return s.handler
+}

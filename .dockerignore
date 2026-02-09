@@ -1,0 +1,6 @@
+.git
+.claude
+data/
+*.rdb
+*.aof
+*.tmp

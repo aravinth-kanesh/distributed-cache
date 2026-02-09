@@ -314,9 +314,83 @@ Go's race detector found several issues during development:
 
 ---
 
+## 11. Persistence: AOF + Binary Snapshots
+
+### Decision
+Use two complementary persistence mechanisms — an append-only file for command-level durability and binary snapshots for fast recovery.
+
+### AOF Design
+
+The AOF hook sits in `Handler.Execute()` — a single `if` block after the command succeeds. No individual command handlers are modified. I use a buffered channel (64K slots) with a dedicated writer goroutine that drains in batches, amortising syscall overhead. Non-blocking send on the hot path means the AOF never stalls command execution.
+
+Three fsync policies:
+- `always` — maximum durability, at most 1 command lost
+- `everysec` — default, lose at most 1 second of data on crash
+- `no` — OS decides, fastest but unbounded loss window
+
+### Snapshot Design
+
+I iterate shards sequentially. For each shard: copy map references under RLock (fast pointer copies), release lock, then encode outside any lock. At most 1/256th of writes are briefly blocked at any moment. Binary format with CRC-32C checksums (hardware-accelerated via SSE 4.2).
+
+### AOF Rewrite
+
+Iterates the store via `ForEachShard`, emitting the minimal command set (1000 INCRs become one SET). Writes to a temp file while the original AOF keeps logging. On completion, atomically renames.
+
+### Interview Answer
+
+> "I use two persistence mechanisms: AOF for command-level durability and binary snapshots for fast recovery. The AOF hook is decoupled from the hot path via a buffered channel — the writer goroutine drains in batches and fsyncs according to policy. Snapshots iterate shards sequentially, copying map references under RLock then encoding outside the lock, so at most 1/256th of writes are briefly blocked."
+
+---
+
+## 12. Replication: Async Master-Slave with PSYNC
+
+### Decision
+Implement Redis-style async replication with full and partial resync via a bounded ring buffer backlog.
+
+### Backlog Design
+
+I use a 1MB circular ring buffer (configurable) that stores raw RESP bytes. The master writes to it on every mutating command. Each slave's streaming goroutine independently reads from it, similar to how the AOF writer decouples disk I/O from command execution. Partial resync is possible when a slave's last offset is still within the buffer.
+
+### Connection Hijacking
+
+PSYNC switches a connection from request-response mode to unidirectional streaming. The handler sets `conn.hijacked = true`, the server's connection loop exits without closing the socket, and the master's streaming goroutine takes ownership. This avoids the overhead of a separate connection for replication.
+
+### Slave Read-Only Guard
+
+I check this in `Execute()` before dispatch, so no individual command handler needs to know about replication roles. REPLICAOF and SLAVEOF are always allowed (to enable promotion).
+
+### Shared Replay Logic
+
+I extracted `ExecuteReplayCommand` as an exported function so both Recovery (AOF replay) and the slave's `StoreApplier` share the same command execution logic — a single ~200-line switch statement rather than duplicate code.
+
+### Interview Answer
+
+> "I use async replication following Redis's model. The master writes mutations to a 1MB ring buffer backlog and each slave's goroutine independently reads from it. For PSYNC, I implemented connection hijacking — the socket switches from request-response to unidirectional streaming without closing. Partial resync from the backlog avoids expensive full snapshots when slaves reconnect quickly."
+
+---
+
+## 13. Observability: Prometheus Metrics
+
+### Decision
+Expose all internal metrics via a Prometheus `/metrics` endpoint on a separate HTTP port.
+
+### Design
+
+I use a custom `prometheus.Collector` that pulls current values from the existing atomic counters on each scrape. This means the metrics collection has zero impact on the hot path — the per-shard counters (gets, sets, hits, misses) are already lock-free atomics. For command-level latency, I add a `time.Since(start)` observation in `Execute()`, guarded behind a nil check so the handler works without metrics.
+
+The metrics HTTP server runs on a separate port (default 9090) from the Redis protocol port (6379).
+
+### Interview Answer
+
+> "I expose all metrics via Prometheus using a custom Collector that scrapes the existing atomic counters on each scrape interval. There's zero overhead on the command hot path for store-level metrics since they're already lock-free atomics. For per-command latency histograms, I add one `time.Now()` call at the start of Execute and observe the duration after dispatch."
+
+---
+
 ## Summary: Design Philosophy
 
 1. **Simple over clever**: RWMutex over lock-free unless proven necessary
 2. **Measure first**: Benchmarks guided optimisation decisions
 3. **Trade-offs are explicit**: Document what I gave up and why
 4. **Production-ready defaults**: 256 shards, lazy expiration, RESP protocol
+5. **Single hook point**: Execute() is the central extensibility mechanism — AOF, replication, and metrics all hook in here
+6. **Decouple from hot path**: Buffered channels for AOF, ring buffer for replication, scrape-time collection for metrics

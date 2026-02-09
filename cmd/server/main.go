@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aravinth/distributed-cache/internal/metrics"
 	"github.com/aravinth/distributed-cache/internal/persistence"
 	"github.com/aravinth/distributed-cache/internal/replication"
 	"github.com/aravinth/distributed-cache/internal/server"
@@ -38,6 +40,9 @@ func main() {
 	// Replication flags
 	replicaOf := flag.String("replicaof", "", "Make this server a replica of another: host:port")
 	replBacklogSize := flag.Int("repl-backlog-size", replication.DefaultBacklogSize, "Replication backlog size in bytes")
+
+	// Metrics flags
+	metricsPort := flag.Int("metrics-port", 9090, "Prometheus metrics HTTP port (0 = disabled)")
 
 	flag.Parse()
 
@@ -81,6 +86,9 @@ func main() {
 		log.Printf("  replicaof:  %s", *replicaOf)
 	}
 	log.Printf("  repl-backlog: %d bytes", *replBacklogSize)
+	if *metricsPort > 0 {
+		log.Printf("  metrics-port: %d", *metricsPort)
+	}
 
 	// Ensure data directory exists
 	if err := os.MkdirAll(*dataDir, 0755); err != nil {
@@ -135,6 +143,15 @@ func main() {
 	// Create server
 	srv := server.New(cfg, sm, aofWriter, snapshotEngine, aofRewriter, replState, masterState, slaveState)
 
+	// Initialise Prometheus metrics
+	var metricsSrv *http.Server
+	if *metricsPort > 0 {
+		collector := metrics.NewCollector(sm, srv, replState, masterState, snapshotEngine, srv.Handler().StartTime())
+		metrics.Register(collector)
+		srv.Handler().SetMetrics(metrics.CommandCount, metrics.CommandDuration)
+		metricsSrv = metrics.StartHTTPServer(*metricsPort)
+	}
+
 	// Context with signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -160,7 +177,13 @@ func main() {
 		log.Fatalf("server error: %v", err)
 	}
 
-	// Shutdown sequencing: flush AOF, take final snapshot
+	// Shutdown sequencing: metrics server, flush AOF, take final snapshot
+	if metricsSrv != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		metrics.ShutdownHTTPServer(shutdownCtx, metricsSrv)
+		shutdownCancel()
+	}
+
 	if aofWriter != nil {
 		log.Println("flushing AOF...")
 		aofWriter.Close()
