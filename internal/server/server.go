@@ -13,6 +13,7 @@ import (
 
 	"github.com/aravinth/distributed-cache/internal/persistence"
 	"github.com/aravinth/distributed-cache/internal/pool"
+	"github.com/aravinth/distributed-cache/internal/replication"
 	"github.com/aravinth/distributed-cache/internal/store"
 )
 
@@ -49,17 +50,23 @@ type Server struct {
 
 	// Metrics
 	totalConns atomic.Uint64
+
+	// Replication — nil when not configured
+	masterState *replication.MasterState
+	slaveState  *replication.SlaveState
 }
 
 // New creates a new server with the given config and backing store.
-// The persistence arguments are optional — pass nil to disable.
-func New(cfg Config, sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persistence.SnapshotEngine, rewriter *persistence.AOFRewriter) *Server {
+// The persistence and replication arguments are optional — pass nil to disable.
+func New(cfg Config, sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persistence.SnapshotEngine, rewriter *persistence.AOFRewriter, rs *replication.ReplState, master *replication.MasterState, slave *replication.SlaveState) *Server {
 	return &Server{
-		config:  cfg,
-		store:   sm,
-		handler: NewHandler(sm, aof, snap, rewriter),
-		bufPool: pool.NewBufferPool(),
-		conns:   make(map[uint64]*Connection),
+		config:      cfg,
+		store:       sm,
+		handler:     NewHandler(sm, aof, snap, rewriter, rs, master, slave),
+		bufPool:     pool.NewBufferPool(),
+		conns:       make(map[uint64]*Connection),
+		masterState: master,
+		slaveState:  slave,
 	}
 }
 
@@ -141,6 +148,16 @@ func (s *Server) handleConnection(ctx context.Context, rawConn net.Conn) {
 	s.connMu.Unlock()
 
 	defer func() {
+		if conn.hijacked.Load() {
+			// The replication subsystem has taken ownership of this
+			// connection. I remove it from tracking but do NOT close
+			// it — the master's streaming goroutine owns the socket.
+			s.connMu.Lock()
+			delete(s.conns, id)
+			s.connMu.Unlock()
+			return
+		}
+
 		// Flush any buffered writes before closing
 		conn.Flush()
 
@@ -194,6 +211,13 @@ func (s *Server) handleConnection(ctx context.Context, rawConn net.Conn) {
 		// Execute the command
 		resp := s.handler.Execute(val, conn)
 
+		// Check if the connection was hijacked by the replication
+		// subsystem (PSYNC command). If so, exit the loop — the
+		// master's streaming goroutine now owns this connection.
+		if conn.hijacked.Load() {
+			return
+		}
+
 		// Write response
 		if err := conn.WriteResponse(resp); err != nil {
 			return
@@ -215,6 +239,14 @@ func (s *Server) handleConnection(ctx context.Context, rawConn net.Conn) {
 // Shutdown gracefully stops the server
 func (s *Server) Shutdown() error {
 	s.shutdown.Store(true)
+
+	// Stop replication subsystems
+	if s.slaveState != nil {
+		s.slaveState.Disconnect()
+	}
+	if s.masterState != nil {
+		s.masterState.Stop()
+	}
 
 	// Stop accepting new connections
 	if s.listener != nil {

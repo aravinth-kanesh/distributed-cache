@@ -9,6 +9,7 @@ import (
 	"github.com/aravinth/distributed-cache/internal/datatype"
 	"github.com/aravinth/distributed-cache/internal/persistence"
 	"github.com/aravinth/distributed-cache/internal/protocol"
+	"github.com/aravinth/distributed-cache/internal/replication"
 	"github.com/aravinth/distributed-cache/internal/store"
 )
 
@@ -29,11 +30,16 @@ type Handler struct {
 	aofWriter      *persistence.AOFWriter
 	snapshotEngine *persistence.SnapshotEngine
 	aofRewriter    *persistence.AOFRewriter
+
+	// Replication — nil when replication is not configured
+	replState   *replication.ReplState
+	masterState *replication.MasterState
+	slaveState  *replication.SlaveState
 }
 
 // NewHandler creates a new handler and registers all commands.
-// The persistence arguments are optional — pass nil to disable AOF/snapshots.
-func NewHandler(sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persistence.SnapshotEngine, rewriter *persistence.AOFRewriter) *Handler {
+// The persistence and replication arguments are optional — pass nil to disable.
+func NewHandler(sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persistence.SnapshotEngine, rewriter *persistence.AOFRewriter, rs *replication.ReplState, master *replication.MasterState, slave *replication.SlaveState) *Handler {
 	h := &Handler{
 		store:          sm,
 		strOps:         datatype.NewStringOps(sm),
@@ -44,6 +50,9 @@ func NewHandler(sm *store.ShardedMap, aof *persistence.AOFWriter, snap *persiste
 		aofWriter:      aof,
 		snapshotEngine: snap,
 		aofRewriter:    rewriter,
+		replState:      rs,
+		masterState:    master,
+		slaveState:     slave,
 	}
 	h.registerCommands()
 	return h
@@ -58,6 +67,16 @@ func (h *Handler) Execute(val protocol.Value, conn *Connection) protocol.Value {
 	cmdName := strings.ToUpper(string(val.Array[0].Bulk))
 	args := val.Array[1:]
 
+	// Slave read-only guard: reject mutating commands when operating
+	// as a slave. I check this before dispatch so no individual command
+	// handler needs to know about replication roles. REPLICAOF, INFO,
+	// REPLCONF, and PSYNC are always allowed.
+	if h.replState != nil && h.replState.Role() == replication.RoleSlave && persistence.IsMutating(cmdName) {
+		if cmdName != "REPLICAOF" && cmdName != "SLAVEOF" {
+			return protocol.ErrorVal("READONLY You can't write against a read only replica.")
+		}
+	}
+
 	fn, exists := h.commands[cmdName]
 	if !exists {
 		return protocol.ErrUnknownCmd(cmdName)
@@ -71,6 +90,13 @@ func (h *Handler) Execute(val protocol.Value, conn *Connection) protocol.Value {
 	// AOFWriter.Log ensures this never stalls the hot path.
 	if h.aofWriter != nil && persistence.IsMutating(cmdName) && result.Type != protocol.Error {
 		h.aofWriter.Log(protocol.MarshalValue(val))
+	}
+
+	// Replication hook: feed successful mutating commands to connected
+	// slaves. I serialise the same RESP bytes that the AOF uses,
+	// keeping the two pipelines consistent.
+	if h.masterState != nil && persistence.IsMutating(cmdName) && result.Type != protocol.Error {
+		h.masterState.FeedCommand(protocol.MarshalValue(val))
 	}
 
 	return result
@@ -173,6 +199,12 @@ func (h *Handler) registerCommands() {
 		"BGREWRITEAOF":  h.cmdBGRewriteAOF,
 		"LASTSAVE":      h.cmdLastSave,
 		"PEXPIREAT":     h.cmdPExpireAt,
+
+		// Replication commands
+		"REPLICAOF": h.cmdReplicaOf,
+		"SLAVEOF":   h.cmdReplicaOf,
+		"REPLCONF":  h.cmdReplConf,
+		"PSYNC":     h.cmdPSync,
 	}
 }
 
@@ -251,6 +283,33 @@ func (h *Handler) cmdInfo(args []protocol.Value, conn *Connection) protocol.Valu
 		metrics["sets"],
 		metrics["deletes"],
 	)
+
+	// Replication section
+	if h.replState != nil {
+		role := h.replState.Role()
+		info += "\r\n# Replication\r\n"
+		info += fmt.Sprintf("role:%s\r\n", role.String())
+		info += fmt.Sprintf("master_replid:%s\r\n", h.replState.ReplID())
+		info += fmt.Sprintf("master_repl_offset:%d\r\n", h.replState.Offset())
+
+		if role == replication.RoleMaster && h.masterState != nil {
+			info += fmt.Sprintf("connected_slaves:%d\r\n", h.masterState.SlaveCount())
+			for _, line := range h.masterState.SlaveInfo() {
+				info += line + "\r\n"
+			}
+		} else if role == replication.RoleSlave {
+			host, port := h.replState.MasterAddr()
+			info += fmt.Sprintf("master_host:%s\r\n", host)
+			info += fmt.Sprintf("master_port:%d\r\n", port)
+			linkStatus := "down"
+			if h.slaveState != nil && h.slaveState.IsConnected() {
+				linkStatus = "up"
+			}
+			info += fmt.Sprintf("master_link_status:%s\r\n", linkStatus)
+			info += fmt.Sprintf("slave_repl_offset:%d\r\n", h.replState.Offset())
+		}
+	}
+
 	return protocol.BulkStringVal([]byte(info))
 }
 
@@ -1353,6 +1412,81 @@ func (h *Handler) cmdPExpireAt(args []protocol.Value, conn *Connection) protocol
 	}
 	entry.ExpiresAt = ms * 1e6 // Milliseconds to nanoseconds
 	return protocol.ValOne
+}
+
+// ==================== Replication commands ====================
+
+func (h *Handler) cmdReplicaOf(args []protocol.Value, conn *Connection) protocol.Value {
+	if len(args) != 2 {
+		return protocol.ErrWrongArgNum("REPLICAOF")
+	}
+
+	host := string(args[0].Bulk)
+	portStr := string(args[1].Bulk)
+
+	// REPLICAOF NO ONE — promote to master
+	if strings.ToUpper(host) == "NO" && strings.ToUpper(portStr) == "ONE" {
+		if h.replState == nil {
+			return protocol.ValOK
+		}
+		if h.slaveState != nil {
+			h.slaveState.Disconnect()
+		}
+		h.replState.SetRole(replication.RoleMaster)
+		h.replState.SetReplID(replication.GenerateReplID())
+		return protocol.ValOK
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return protocol.ErrorVal("ERR invalid port number")
+	}
+
+	if h.replState == nil {
+		return protocol.ErrorVal("ERR replication not initialised")
+	}
+
+	// Disconnect from current master if already a slave
+	if h.slaveState != nil {
+		h.slaveState.Disconnect()
+	}
+
+	h.slaveState.ConnectToMaster(host, port)
+	return protocol.ValOK
+}
+
+func (h *Handler) cmdReplConf(args []protocol.Value, conn *Connection) protocol.Value {
+	if h.masterState != nil {
+		return h.masterState.HandleREPLCONF(args)
+	}
+	return protocol.ValOK
+}
+
+func (h *Handler) cmdPSync(args []protocol.Value, conn *Connection) protocol.Value {
+	if h.masterState == nil {
+		return protocol.ErrorVal("ERR this server is not a master")
+	}
+	if len(args) != 2 {
+		return protocol.ErrWrongArgNum("PSYNC")
+	}
+
+	replID := string(args[0].Bulk)
+	offset, err := strconv.ParseInt(string(args[1].Bulk), 10, 64)
+	if err != nil {
+		return protocol.ErrorVal("ERR invalid offset")
+	}
+
+	// Flush any pending response before hijacking
+	conn.Flush()
+
+	// Hijack the connection: the replication subsystem takes ownership.
+	// The server's handleConnection loop will exit without closing it.
+	conn.hijacked.Store(true)
+
+	h.masterState.HandlePSYNC(conn.RawConn(), conn.Reader(), replID, offset)
+
+	// Return a special empty value — the connection is no longer ours
+	return protocol.Value{}
 }
 
 // ==================== Utility ====================

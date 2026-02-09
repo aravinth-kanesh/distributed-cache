@@ -122,9 +122,16 @@ func (r *Recovery) loadSnapshot(path string) (int64, error) {
 	}
 	defer f.Close()
 
-	dec := NewSnapshotDecoder(f)
+	return r.LoadSnapshotFromReader(f)
+}
 
-	_, _, err = dec.ReadHeader()
+// LoadSnapshotFromReader decodes a binary snapshot from any io.Reader
+// into the store. I export this so the replication slave can load a
+// snapshot received over the network without writing to disk first.
+func (r *Recovery) LoadSnapshotFromReader(rd io.Reader) (int64, error) {
+	dec := NewSnapshotDecoder(rd)
+
+	_, _, err := dec.ReadHeader()
 	if err != nil {
 		return 0, fmt.Errorf("reading header: %w", err)
 	}
@@ -241,10 +248,24 @@ func (r *Recovery) replayAOF(path string) (int64, error) {
 	return replayed, nil
 }
 
-// executeCommand replays a single parsed command into the store.
-// I handle each command type directly rather than going through the
-// handler to avoid re-logging to AOF and for cleaner error handling.
+// executeCommand delegates to the shared ExecuteReplayCommand function.
 func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
+	return ExecuteReplayCommand(r.store, r.strOps, r.listOps, r.hashOps, r.setOps, cmd, args)
+}
+
+// ExecuteReplayCommand applies a single parsed command into the store.
+// I export this so the replication slave can reuse the same replay logic
+// without duplicating the ~200-line switch statement. Both Recovery and
+// the slave's StoreApplier delegate here.
+func ExecuteReplayCommand(
+	sm *store.ShardedMap,
+	strOps *datatype.StringOps,
+	listOps *datatype.ListOps,
+	hashOps *datatype.HashOps,
+	setOps *datatype.SetOps,
+	cmd string,
+	args []protocol.Value,
+) error {
 	switch cmd {
 	// String commands
 	case "SET":
@@ -253,18 +274,18 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 		}
 		key := string(args[0].Bulk)
 		value := args[1].Bulk
-		r.strOps.Set(key, value)
+		strOps.Set(key, value)
 		// Handle EX/PX flags
 		for i := 2; i < len(args)-1; i++ {
 			flag := strings.ToUpper(string(args[i].Bulk))
 			switch flag {
 			case "EX":
 				secs, _ := parseInt64Bytes(args[i+1].Bulk)
-				r.strOps.SetWithTTL(key, value, secs)
+				strOps.SetWithTTL(key, value, secs)
 				i++
 			case "PX":
 				ms, _ := parseInt64Bytes(args[i+1].Bulk)
-				entry, exists := r.store.GetEntry(key)
+				entry, exists := sm.GetEntry(key)
 				if exists {
 					entry.ExpiresAt = time.Now().Add(time.Duration(ms) * time.Millisecond).UnixNano()
 				}
@@ -273,11 +294,11 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 		}
 	case "SETNX":
 		if len(args) >= 2 {
-			r.strOps.SetNX(string(args[0].Bulk), args[1].Bulk)
+			strOps.SetNX(string(args[0].Bulk), args[1].Bulk)
 		}
 	case "GETSET":
 		if len(args) >= 2 {
-			r.strOps.GetSet(string(args[0].Bulk), args[1].Bulk)
+			strOps.GetSet(string(args[0].Bulk), args[1].Bulk)
 		}
 	case "MSET":
 		if len(args) >= 2 && len(args)%2 == 0 {
@@ -285,93 +306,93 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 0; i < len(args); i += 2 {
 				pairs[string(args[i].Bulk)] = args[i+1].Bulk
 			}
-			r.strOps.MSet(pairs)
+			strOps.MSet(pairs)
 		}
 	case "INCR":
 		if len(args) >= 1 {
-			r.strOps.Incr(string(args[0].Bulk))
+			strOps.Incr(string(args[0].Bulk))
 		}
 	case "INCRBY":
 		if len(args) >= 2 {
 			delta, _ := parseInt64Bytes(args[1].Bulk)
-			r.strOps.IncrBy(string(args[0].Bulk), delta)
+			strOps.IncrBy(string(args[0].Bulk), delta)
 		}
 	case "DECR":
 		if len(args) >= 1 {
-			r.strOps.Decr(string(args[0].Bulk))
+			strOps.Decr(string(args[0].Bulk))
 		}
 	case "DECRBY":
 		if len(args) >= 2 {
 			delta, _ := parseInt64Bytes(args[1].Bulk)
-			r.strOps.DecrBy(string(args[0].Bulk), delta)
+			strOps.DecrBy(string(args[0].Bulk), delta)
 		}
 	case "INCRBYFLOAT":
 		if len(args) >= 2 {
-			r.strOps.IncrByFloat(string(args[0].Bulk), parseFloat64(args[1].Bulk))
+			strOps.IncrByFloat(string(args[0].Bulk), parseFloat64(args[1].Bulk))
 		}
 	case "APPEND":
 		if len(args) >= 2 {
-			r.strOps.Append(string(args[0].Bulk), args[1].Bulk)
+			strOps.Append(string(args[0].Bulk), args[1].Bulk)
 		}
 	case "SETRANGE":
 		if len(args) >= 3 {
 			offset, _ := parseInt64Bytes(args[1].Bulk)
-			r.strOps.SetRange(string(args[0].Bulk), int(offset), args[2].Bulk)
+			strOps.SetRange(string(args[0].Bulk), int(offset), args[2].Bulk)
 		}
 
 	// List commands
 	case "LPUSH":
 		if len(args) >= 2 {
 			vals := bulkSlice(args[1:])
-			r.listOps.LPush(string(args[0].Bulk), vals...)
+			listOps.LPush(string(args[0].Bulk), vals...)
 		}
 	case "RPUSH":
 		if len(args) >= 2 {
 			vals := bulkSlice(args[1:])
-			r.listOps.RPush(string(args[0].Bulk), vals...)
+			listOps.RPush(string(args[0].Bulk), vals...)
 		}
 	case "LPOP":
 		if len(args) >= 1 {
-			r.listOps.LPop(string(args[0].Bulk))
+			listOps.LPop(string(args[0].Bulk))
 		}
 	case "RPOP":
 		if len(args) >= 1 {
-			r.listOps.RPop(string(args[0].Bulk))
+			listOps.RPop(string(args[0].Bulk))
 		}
 	case "LSET":
 		if len(args) >= 3 {
 			idx, _ := parseInt64Bytes(args[1].Bulk)
-			r.listOps.LSet(string(args[0].Bulk), idx, args[2].Bulk)
+			listOps.LSet(string(args[0].Bulk), idx, args[2].Bulk)
 		}
 	case "LTRIM":
 		if len(args) >= 3 {
 			start, _ := parseInt64Bytes(args[1].Bulk)
 			stop, _ := parseInt64Bytes(args[2].Bulk)
-			r.listOps.LTrim(string(args[0].Bulk), start, stop)
+			listOps.LTrim(string(args[0].Bulk), start, stop)
 		}
 	case "LREM":
 		if len(args) >= 3 {
 			count, _ := parseInt64Bytes(args[1].Bulk)
-			r.listOps.LRem(string(args[0].Bulk), count, args[2].Bulk)
+			listOps.LRem(string(args[0].Bulk), count, args[2].Bulk)
 		}
 	case "LINSERT":
 		if len(args) >= 4 {
 			before := strings.ToUpper(string(args[1].Bulk)) == "BEFORE"
-			r.listOps.LInsert(string(args[0].Bulk), before, args[2].Bulk, args[3].Bulk)
+			listOps.LInsert(string(args[0].Bulk), before, args[2].Bulk, args[3].Bulk)
 		}
 	case "LPUSHX":
 		if len(args) >= 2 {
 			vals := bulkSlice(args[1:])
-			r.listOps.LPushX(string(args[0].Bulk), vals...)
+			listOps.LPushX(string(args[0].Bulk), vals...)
 		}
 	case "RPUSHX":
 		if len(args) >= 2 {
 			vals := bulkSlice(args[1:])
-			r.listOps.RPushX(string(args[0].Bulk), vals...)
+			listOps.RPushX(string(args[0].Bulk), vals...)
 		}
 	case "LMOVE":
 		if len(args) >= 4 {
-			r.listOps.LMove(string(args[0].Bulk), string(args[1].Bulk),
+			listOps.LMove(string(args[0].Bulk), string(args[1].Bulk),
 				strings.ToUpper(string(args[2].Bulk)), strings.ToUpper(string(args[3].Bulk)))
 		}
 
@@ -382,7 +403,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				fvs[i-1] = args[i].Bulk
 			}
-			r.hashOps.HSet(string(args[0].Bulk), fvs...)
+			hashOps.HSet(string(args[0].Bulk), fvs...)
 		}
 	case "HDEL":
 		if len(args) >= 2 {
@@ -390,7 +411,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				fields[i-1] = string(args[i].Bulk)
 			}
-			r.hashOps.HDel(string(args[0].Bulk), fields...)
+			hashOps.HDel(string(args[0].Bulk), fields...)
 		}
 	case "HMSET":
 		if len(args) >= 3 {
@@ -398,20 +419,20 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args)-1; i += 2 {
 				pairs[string(args[i].Bulk)] = args[i+1].Bulk
 			}
-			r.hashOps.HMSet(string(args[0].Bulk), pairs)
+			hashOps.HMSet(string(args[0].Bulk), pairs)
 		}
 	case "HSETNX":
 		if len(args) >= 3 {
-			r.hashOps.HSetNX(string(args[0].Bulk), string(args[1].Bulk), args[2].Bulk)
+			hashOps.HSetNX(string(args[0].Bulk), string(args[1].Bulk), args[2].Bulk)
 		}
 	case "HINCRBY":
 		if len(args) >= 3 {
 			delta, _ := parseInt64Bytes(args[2].Bulk)
-			r.hashOps.HIncrBy(string(args[0].Bulk), string(args[1].Bulk), delta)
+			hashOps.HIncrBy(string(args[0].Bulk), string(args[1].Bulk), delta)
 		}
 	case "HINCRBYFLOAT":
 		if len(args) >= 3 {
-			r.hashOps.HIncrByFloat(string(args[0].Bulk), string(args[1].Bulk), parseFloat64(args[2].Bulk))
+			hashOps.HIncrByFloat(string(args[0].Bulk), string(args[1].Bulk), parseFloat64(args[2].Bulk))
 		}
 
 	// Set commands
@@ -421,7 +442,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				members[i-1] = string(args[i].Bulk)
 			}
-			r.setOps.SAdd(string(args[0].Bulk), members...)
+			setOps.SAdd(string(args[0].Bulk), members...)
 		}
 	case "SREM":
 		if len(args) >= 2 {
@@ -429,15 +450,15 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				members[i-1] = string(args[i].Bulk)
 			}
-			r.setOps.SRem(string(args[0].Bulk), members...)
+			setOps.SRem(string(args[0].Bulk), members...)
 		}
 	case "SPOP":
 		if len(args) >= 1 {
-			r.setOps.SPop(string(args[0].Bulk))
+			setOps.SPop(string(args[0].Bulk))
 		}
 	case "SMOVE":
 		if len(args) >= 3 {
-			r.setOps.SMove(string(args[0].Bulk), string(args[1].Bulk), string(args[2].Bulk))
+			setOps.SMove(string(args[0].Bulk), string(args[1].Bulk), string(args[2].Bulk))
 		}
 	case "SUNIONSTORE":
 		if len(args) >= 2 {
@@ -445,7 +466,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				keys[i-1] = string(args[i].Bulk)
 			}
-			r.setOps.SUnionStore(string(args[0].Bulk), keys...)
+			setOps.SUnionStore(string(args[0].Bulk), keys...)
 		}
 	case "SINTERSTORE":
 		if len(args) >= 2 {
@@ -453,7 +474,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				keys[i-1] = string(args[i].Bulk)
 			}
-			r.setOps.SInterStore(string(args[0].Bulk), keys...)
+			setOps.SInterStore(string(args[0].Bulk), keys...)
 		}
 	case "SDIFFSTORE":
 		if len(args) >= 2 {
@@ -461,7 +482,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i := 1; i < len(args); i++ {
 				keys[i-1] = string(args[i].Bulk)
 			}
-			r.setOps.SDiffStore(string(args[0].Bulk), keys...)
+			setOps.SDiffStore(string(args[0].Bulk), keys...)
 		}
 
 	// Key management commands
@@ -471,12 +492,12 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 			for i, a := range args {
 				keys[i] = string(a.Bulk)
 			}
-			r.store.DeleteMulti(keys...)
+			sm.DeleteMulti(keys...)
 		}
 	case "EXPIRE":
 		if len(args) >= 2 {
 			secs, _ := parseInt64Bytes(args[1].Bulk)
-			entry, exists := r.store.GetEntry(string(args[0].Bulk))
+			entry, exists := sm.GetEntry(string(args[0].Bulk))
 			if exists {
 				entry.SetTTL(secs)
 			}
@@ -484,7 +505,7 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 	case "PEXPIRE":
 		if len(args) >= 2 {
 			ms, _ := parseInt64Bytes(args[1].Bulk)
-			entry, exists := r.store.GetEntry(string(args[0].Bulk))
+			entry, exists := sm.GetEntry(string(args[0].Bulk))
 			if exists {
 				entry.ExpiresAt = time.Now().Add(time.Duration(ms) * time.Millisecond).UnixNano()
 			}
@@ -492,24 +513,24 @@ func (r *Recovery) executeCommand(cmd string, args []protocol.Value) error {
 	case "PEXPIREAT":
 		if len(args) >= 2 {
 			ms, _ := parseInt64Bytes(args[1].Bulk)
-			entry, exists := r.store.GetEntry(string(args[0].Bulk))
+			entry, exists := sm.GetEntry(string(args[0].Bulk))
 			if exists {
 				entry.ExpiresAt = ms * 1e6 // Milliseconds to nanoseconds
 			}
 		}
 	case "PERSIST":
 		if len(args) >= 1 {
-			entry, exists := r.store.GetEntry(string(args[0].Bulk))
+			entry, exists := sm.GetEntry(string(args[0].Bulk))
 			if exists {
 				entry.Persist()
 			}
 		}
 	case "RENAME":
 		if len(args) >= 2 {
-			r.store.Rename(string(args[0].Bulk), string(args[1].Bulk))
+			sm.Rename(string(args[0].Bulk), string(args[1].Bulk))
 		}
 	case "FLUSHDB", "FLUSHALL":
-		r.store.Clear()
+		sm.Clear()
 	}
 
 	return nil

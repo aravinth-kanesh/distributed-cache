@@ -5,13 +5,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aravinth/distributed-cache/internal/persistence"
+	"github.com/aravinth/distributed-cache/internal/replication"
 	"github.com/aravinth/distributed-cache/internal/server"
 	"github.com/aravinth/distributed-cache/internal/store"
 )
@@ -30,6 +34,10 @@ func main() {
 	appendOnly := flag.Bool("appendonly", pcfg.AOFEnabled, "Enable append-only file")
 	aofFsync := flag.String("aof-fsync", "everysec", "AOF fsync policy: always, everysec, no")
 	saveInterval := flag.Int("save-interval", 300, "Snapshot interval in seconds (0 = disabled)")
+
+	// Replication flags
+	replicaOf := flag.String("replicaof", "", "Make this server a replica of another: host:port")
+	replBacklogSize := flag.Int("repl-backlog-size", replication.DefaultBacklogSize, "Replication backlog size in bytes")
 
 	flag.Parse()
 
@@ -69,6 +77,10 @@ func main() {
 	log.Printf("  appendonly: %v", *appendOnly)
 	log.Printf("  aof-fsync:  %s", *aofFsync)
 	log.Printf("  save-interval: %ds", *saveInterval)
+	if *replicaOf != "" {
+		log.Printf("  replicaof:  %s", *replicaOf)
+	}
+	log.Printf("  repl-backlog: %d bytes", *replBacklogSize)
 
 	// Ensure data directory exists
 	if err := os.MkdirAll(*dataDir, 0755); err != nil {
@@ -105,8 +117,23 @@ func main() {
 		aofRewriter = persistence.NewAOFRewriter(sm, pcfg, aofWriter)
 	}
 
+	// Initialise replication
+	replState := replication.NewReplState()
+	masterState := replication.NewMasterState(replState, sm, snapshotEngine, pcfg, *replBacklogSize)
+
+	var slaveState *replication.SlaveState
+
+	if *replicaOf != "" {
+		host, port, err := parseHostPort(*replicaOf)
+		if err != nil {
+			log.Fatalf("invalid --replicaof value %q: %v", *replicaOf, err)
+		}
+		slaveState = replication.NewSlaveState(replState, sm, pcfg, cfg.Port)
+		slaveState.ConnectToMaster(host, port)
+	}
+
 	// Create server
-	srv := server.New(cfg, sm, aofWriter, snapshotEngine, aofRewriter)
+	srv := server.New(cfg, sm, aofWriter, snapshotEngine, aofRewriter, replState, masterState, slaveState)
 
 	// Context with signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,6 +143,9 @@ func main() {
 	if snapshotEngine != nil {
 		snapshotEngine.Start(ctx)
 	}
+
+	// Start master heartbeat
+	masterState.Start(ctx)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -146,4 +176,23 @@ func main() {
 	}
 
 	log.Println("shutdown complete")
+}
+
+// parseHostPort splits a "host:port" string into its components.
+func parseHostPort(s string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil {
+		// Try treating the whole thing as host:port without brackets
+		parts := strings.SplitN(s, ":", 2)
+		if len(parts) != 2 {
+			return "", 0, fmt.Errorf("expected host:port format")
+		}
+		host = parts[0]
+		portStr = parts[1]
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port: %w", err)
+	}
+	return host, port, nil
 }

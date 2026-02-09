@@ -20,6 +20,11 @@ type Connection struct {
 	createdAt  time.Time
 	lastActive atomic.Int64
 	addr       string
+
+	// hijacked is set by the PSYNC handler to indicate that the
+	// replication subsystem has taken ownership of this connection.
+	// The server's handleConnection loop exits without closing it.
+	hijacked atomic.Bool
 }
 
 // NewConnection creates a new Connection wrapping a net.Conn
@@ -71,4 +76,16 @@ func (c *Connection) ID() uint64 {
 // Addr returns the remote address
 func (c *Connection) Addr() string {
 	return c.addr
+}
+
+// RawConn returns the underlying net.Conn. I expose this so that the
+// PSYNC handler can hijack the connection for the replication stream,
+// bypassing the normal request-response loop.
+func (c *Connection) RawConn() net.Conn {
+	return c.conn
+}
+
+// Reader returns the protocol reader for this connection.
+func (c *Connection) Reader() *protocol.Reader {
+	return c.reader
 }
