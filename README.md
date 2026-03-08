@@ -5,7 +5,7 @@ A Redis-compatible, high-performance distributed in-memory cache I built in Go. 
 ## Features
 
 - **Core Store**: 256-shard concurrent map with RWMutex per shard, xxHash, 4 data types (string, list, hash, set)
-- **RESP Protocol**: Full Redis wire compatibility — works with `redis-cli`, `redis-benchmark`, and all Redis client libraries
+- **RESP Protocol**: Full Redis wire compatibility - works with `redis-cli`, `redis-benchmark`, and all Redis client libraries
 - **Persistence**: Append-only file (AOF) with configurable fsync + binary snapshots with CRC-32C checksums
 - **Replication**: Async master-slave replication with PSYNC, full/partial resync, and connection hijacking
 - **Observability**: Prometheus metrics on `/metrics` with per-command latency histograms
@@ -369,7 +369,3 @@ func (sm *ShardedMap) Rename(oldKey, newKey string) bool {
 2. **Lock contention**: Addressed with 256-shard design
 3. **GC pressure**: Addressed with object reuse and pooling
 4. **Network I/O**: Use buffered I/O (64KB buffers)
-
-## License
-
-MIT
