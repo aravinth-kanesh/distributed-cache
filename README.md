@@ -111,11 +111,11 @@ docker compose up --build
 
 Every command passes through `Handler.Execute()`, which is the single hook point for:
 
-1. **Slave read-only guard** — reject writes when operating as a slave
-2. **Command dispatch** — route to the appropriate handler
-3. **Metrics** — increment command counter, observe latency histogram
-4. **AOF hook** — log successful mutating commands for durability
-5. **Replication hook** — feed successful mutations to connected slaves
+1. **Slave read-only guard** - reject writes when operating as a slave
+2. **Command dispatch** - route to the appropriate handler
+3. **Metrics** - increment command counter, observe latency histogram
+4. **AOF hook** - log successful mutating commands for durability
+5. **Replication hook** - feed successful mutations to connected slaves
 
 ## Configuration
 
@@ -165,13 +165,13 @@ When `--metrics-port` is set, DCache exposes Prometheus metrics at `http://local
 
 ### 3. Lazy Expiration
 
-- Keys checked on access — zero background overhead
+- Keys checked on access - zero background overhead
 - Trade-off: expired keys consume memory until accessed
 - Suitable for high-frequency access patterns in trading systems
 
 ### 4. Lock-Free Metrics
 
-- All counters use `sync/atomic` — zero lock contention for observability
+- All counters use `sync/atomic` - zero lock contention for observability
 - Per-shard metrics aggregated on demand
 
 ### 5. Persistence: AOF + Snapshots
