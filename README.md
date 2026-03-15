@@ -20,7 +20,7 @@ A Redis-compatible, high-performance distributed in-memory cache built in Go.
 | Mixed 80/20 | **33M+ ops/sec** | 36.49 ns |
 | DELETE | **65M+ ops/sec** | 18.07 ns |
 
-*Benchmarked on Apple M2, 8 cores*
+*Benchmarked on Apple Macbook Air M2, 8 cores*
 
 ## Quick Start
 
