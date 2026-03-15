@@ -1,11 +1,11 @@
 # DCache - High-Performance Distributed In-Memory Cache
 
-A Redis-compatible, high-performance distributed in-memory cache I built in Go. I designed this to demonstrate advanced systems programming concepts for technical interviews at trading firms.
+A Redis-compatible, high-performance distributed in-memory cache built in Go.
 
 ## Features
 
 - **Core Store**: 256-shard concurrent map with RWMutex per shard, xxHash, 4 data types (string, list, hash, set)
-- **RESP Protocol**: Full Redis wire compatibility - works with `redis-cli`, `redis-benchmark`, and all Redis client libraries
+- **RESP Protocol**: Full Redis wire compatibility; works with `redis-cli`, `redis-benchmark`, and all Redis client libraries
 - **Persistence**: Append-only file (AOF) with configurable fsync + binary snapshots with CRC-32C checksums
 - **Replication**: Async master-slave replication with PSYNC, full/partial resync, and connection hijacking
 - **Observability**: Prometheus metrics on `/metrics` with per-command latency histograms
@@ -111,11 +111,11 @@ docker compose up --build
 
 Every command passes through `Handler.Execute()`, which is the single hook point for:
 
-1. **Slave read-only guard** - reject writes when operating as a slave
-2. **Command dispatch** - route to the appropriate handler
-3. **Metrics** - increment command counter, observe latency histogram
-4. **AOF hook** - log successful mutating commands for durability
-5. **Replication hook** - feed successful mutations to connected slaves
+1. **Slave read-only guard** — reject writes when operating as a slave
+2. **Command dispatch** — route to the appropriate handler
+3. **Metrics** — increment command counter, observe latency histogram
+4. **AOF hook** — log successful mutating commands for durability
+5. **Replication hook** — feed successful mutations to connected slaves
 
 ## Configuration
 
@@ -165,13 +165,13 @@ When `--metrics-port` is set, DCache exposes Prometheus metrics at `http://local
 
 ### 3. Lazy Expiration
 
-- Keys checked on access - zero background overhead
+- Keys checked on access — zero background overhead
 - Trade-off: expired keys consume memory until accessed
 - Suitable for high-frequency access patterns in trading systems
 
 ### 4. Lock-Free Metrics
 
-- All counters use `sync/atomic` - zero lock contention for observability
+- All counters use `sync/atomic` — zero lock contention for observability
 - Per-shard metrics aggregated on demand
 
 ### 5. Persistence: AOF + Snapshots
@@ -199,20 +199,12 @@ When `--metrics-port` is set, DCache exposes Prometheus metrics at `http://local
 ## Supported Commands
 
 **Server**: PING, ECHO, QUIT, SELECT, INFO, COMMAND, DBSIZE, FLUSHDB, FLUSHALL
-
 **Keys**: DEL, EXISTS, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST, TYPE, RENAME, KEYS
-
 **Strings**: GET, SET (EX/PX/NX/XX), SETNX, GETSET, MGET, MSET, INCR, INCRBY, DECR, DECRBY, INCRBYFLOAT, APPEND, STRLEN, GETRANGE, SETRANGE
-
 **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LINDEX, LRANGE, LSET, LTRIM, LREM, LINSERT, LPUSHX, RPUSHX, LMOVE
-
 **Hashes**: HSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HSETNX, HINCRBY, HINCRBYFLOAT, HSTRLEN
-
-**Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP, SRANDMEMBER, SMOVE, SUNION, SUNIONSTORE, SINTER, SINTERSTORE, 
-SINTERCARD, SDIFF, SDIFFSTORE
-
+**Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP, SRANDMEMBER, SMOVE, SUNION, SUNIONSTORE, SINTER, SINTERSTORE, SINTERCARD, SDIFF, SDIFFSTORE
 **Persistence**: BGSAVE, BGREWRITEAOF, LASTSAVE
-
 **Replication**: REPLICAOF, SLAVEOF, REPLCONF, PSYNC
 
 ## Project Structure
@@ -312,7 +304,7 @@ type Shard struct {
 
 ### Avoiding Deadlocks
 
-The `Rename` operation requires locking two shards. I prevent deadlocks by locking shards in consistent address order:
+The `Rename` operation requires locking two shards. Deadlocks are prevented by locking shards in consistent address order:
 
 ```go
 func (sm *ShardedMap) Rename(oldKey, newKey string) bool {
@@ -326,46 +318,6 @@ func (sm *ShardedMap) Rename(oldKey, newKey string) bool {
 }
 ```
 
-## Interview Talking Points
+## License
 
-### "Why Go over Rust/C++?"
-
-1. **Goroutines**: Lightweight concurrency (2KB stack vs 1MB threads)
-2. **GC**: Acceptable for sub-millisecond targets with proper tuning
-3. **Development velocity**: Faster iteration than Rust's ownership model
-4. **Standard library**: Excellent networking primitives
-
-### "How does your system handle concurrent writes to the same key?"
-
-1. Sharding distributes keys across 256 independent mutexes
-2. Same-key writes serialise at the shard level via RWMutex
-3. Atomic operations (SetNX, IncrBy) use lock-then-modify pattern
-4. Update function holds lock during entire read-modify-write
-
-### "What's your consistency model?"
-
-- **Single-node**: Linearisable (mutex-protected operations)
-- **Replicated**: Eventual consistency with async replication
-- **Trade-off**: Chose availability over strict consistency for trading workloads
-
-### "How does replication work?"
-
-1. Master records all mutations in a bounded ring buffer backlog
-2. New slaves receive a full snapshot + backlog gap, then stream live
-3. Reconnecting slaves with valid offsets get a partial resync from the backlog
-4. Connection hijacking: PSYNC switches from request-response to streaming without closing the socket
-5. Slaves are read-only - writes are rejected before command dispatch
-
-### "How do you ensure durability?"
-
-1. AOF logs every mutating command to disk via a buffered channel
-2. Configurable fsync: `always` (max safety), `everysec` (default), `no` (fastest)
-3. Binary snapshots with CRC-32C checksums run periodically or on demand
-4. Recovery: load latest snapshot, replay AOF tail, verify checksums
-
-### "What are the main bottlenecks?"
-
-1. **Memory allocations**: Addressed with `sync.Pool` for buffers
-2. **Lock contention**: Addressed with 256-shard design
-3. **GC pressure**: Addressed with object reuse and pooling
-4. **Network I/O**: Use buffered I/O (64KB buffers)
+MIT
